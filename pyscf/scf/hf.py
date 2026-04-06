@@ -33,14 +33,12 @@ from pyscf.scf import diis
 from pyscf.scf import _vhf
 from pyscf.scf import chkfile
 from pyscf.scf import dispersion
-from pyscf.scf import smearing
 from pyscf.data import nist
 from pyscf import __config__
 from pyscf.scf.data_processing import process_orbital_data, generate_features
 from sklearn.ensemble import GradientBoostingClassifier
 import pickle
 import os
-import random
 
 
 WITH_META_LOWDIN = getattr(__config__, 'scf_analyze_with_meta_lowdin', True)
@@ -48,42 +46,6 @@ PRE_ORTH_METHOD = getattr(__config__, 'scf_analyze_pre_orth_method', 'ANO')
 MO_BASE = getattr(__config__, 'MO_BASE', 1)
 TIGHT_GRAD_CONV_TOL = getattr(__config__, 'scf_hf_kernel_tight_grad_conv_tol', True)
 MUTE_CHKFILE = getattr(__config__, 'scf_hf_SCF_mute_chkfile', False)
-
-def reset_diis(mf, one_plain_step=False, fresh_file=True):
-    # Preserve knobs
-    space     = getattr(mf.diis, 'space',     getattr(mf, 'diis_space', 8)) if isinstance(mf.diis, lib.diis.DIIS) else getattr(mf, 'diis_space', 8)
-    rollback  = getattr(mf.diis, 'rollback',  getattr(mf, 'diis_space_rollback', None)) if isinstance(mf.diis, lib.diis.DIIS) else getattr(mf, 'diis_space_rollback', None)
-    damp      = getattr(mf.diis, 'damp',      getattr(mf, 'diis_damp', 0.0)) if isinstance(mf.diis, lib.diis.DIIS) else getattr(mf, 'diis_damp', 0.0)
-
-    # Optional: take exactly one step with DIIS disabled under the new Hamiltonian
-    if one_plain_step:
-        mf.diis = None
-        mf.diis_start_cycle = 9_999_999  # effectively off; you'll set back to 0 below
-
-    # IMPORTANT: avoid reusing the same out-of-core file (it can keep stale arrays)
-    diis_file = None
-    if not fresh_file:
-        diis_file = getattr(mf, 'diis_file', None)
-    else:
-        # create a truly fresh file so nothing "leaks" from a previous DIIS
-        fd, path = tempfile.mkstemp(prefix="pyscf_diis_", suffix=".h5")
-        os.close(fd)
-        diis_file = path
-
-    # Recreate the configured flavor (CDIIS/ADIIS/EDIIS)
-    mf.diis = mf.DIIS(mf, diis_file)
-    mf.diis.space    = space
-    mf.diis.rollback = rollback
-    mf.diis.damp     = damp
-    mf.diis_start_cycle = 0  # start immediately
-
-    # For callers that may still have f_prev
-    if hasattr(mf, '_last_fock'):
-        mf._last_fock = None
-
-    # Optional: record a generation counter
-    mf._diis_generation = getattr(mf, '_diis_generation', 0) + 1
-    return space, damp
 
 def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
            dump_chk=True, dm0=None, callback=None, conv_check=True, dynamic_ls=False, **kwargs):
@@ -159,7 +121,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         logger.info(mf, 'Set gradient conv threshold to %g', conv_tol_grad)
     if hasattr(mf, 'dynamic_ls'):
         dynamic_ls = mf.dynamic_ls
-    
+
     mol = mf.mol
     s1e = mf.get_ovlp(mol)
 
@@ -219,7 +181,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     homo_1_beta_10 = []
     homo_beta_10 = []
     ls_cycles = 0
-    cooldown_counter = 0
+    threshold = 0.802 
 
     try:
         model_path = os.path.join(os.path.dirname(__file__), 'gb_10k_refined.pkl')
@@ -231,7 +193,8 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     except pickle.UnpicklingError:
         logger.error(mf, 'Error loading ML model file.')
         raise
-    
+
+
     for cycle in range(mf.max_cycle):
         dm_last = dm
         last_hf_e = e_tot
@@ -254,90 +217,40 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         norm_ddm = numpy.linalg.norm(dm-dm_last)
         logger.info(mf, 'cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                     cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
-        if dynamic_ls:
-            if isinstance(mo_energy[0], numpy.ndarray):
-                alpha_gap, homo_alpha, homo_1_beta, homo_beta = process_orbital_data(mo_energy, mo_occ)
-                en_tot_10.append(e_tot)
-                alpha_gap_10.append(alpha_gap)
-                homo_alpha_10.append(homo_alpha)
-                homo_1_beta_10.append(homo_1_beta)
-                homo_beta_10.append(homo_beta)
+        
+        if isinstance(mo_energy[0], numpy.ndarray) and dynamic_ls:
+            alpha_gap, homo_alpha, homo_1_beta, homo_beta = process_orbital_data(mo_energy, mo_occ)
+            en_tot_10.append(e_tot)
+            alpha_gap_10.append(alpha_gap)
+            homo_alpha_10.append(homo_alpha)
+            homo_1_beta_10.append(homo_1_beta)
+            homo_beta_10.append(homo_beta)
 
-                # Keep only the last 10 iterations in the lists
-                if len(en_tot_10) > 10:
-                    en_tot_10.pop(0)
-                if len(alpha_gap_10) > 10:
-                    alpha_gap_10.pop(0)
-                if len(homo_alpha_10) > 10:
-                    homo_alpha_10.pop(0)
-                if len(homo_1_beta_10) > 10:
-                    homo_1_beta_10.pop(0)
-                if len(homo_beta_10) > 10:
-                    homo_beta_10.pop(0)
+            # Keep only the last 10 iterations in the lists
+            if len(en_tot_10) > 10:
+                en_tot_10.pop(0)
+            if len(alpha_gap_10) > 10:
+                alpha_gap_10.pop(0)
+            if len(homo_alpha_10) > 10:
+                homo_alpha_10.pop(0)
+            if len(homo_1_beta_10) > 10:
+                homo_1_beta_10.pop(0)
+            if len(homo_beta_10) > 10:
+                homo_beta_10.pop(0)
 
-                if cycle > 10:
-                    features = generate_features(en_tot_10, homo_alpha_10, homo_1_beta_10, homo_beta_10, alpha_gap_10)
+            if cycle > 10:
+                features = generate_features(en_tot_10, homo_alpha_10, homo_1_beta_10, homo_beta_10, alpha_gap_10)
 
-                    logger.info(mf, 'Features used for ML prediction: %s', features)
-                    
-                    need_ls = bool(gb.predict_proba(features)[0, 1] >= 0.802)
+                logger.info(mf, 'Features used for ML prediction: %s', features)
+                logger.info(mf, 'Prediction: %.2f', gb.predict_proba(features)[0, 1])
 
-                    # Use ML model to predict whether level shifting is needed
-                    if need_ls:
-                    #     raise RuntimeError("Restart SCF with new alpha shift.")  # External logic should handle restart
-                    # else:
-                    #     logger.info(mf, 'ML predicts easy convergence. Proceeding calculation.')
-                    # Set level shifting for both alpha and beta spins
-                        if mf.level_shift == 0 or mf.level_shift == (0.0, 0.0): # Check if level shifting is off
-                            if cooldown_counter > 0:
-                                cooldown_counter -= 1
-                                logger.info(mf,  'Level shifting is suggested but in cooldown cycle.')
-                            else:
-                                alpha_shift = 0.0  # Example value for alpha spin
-                                beta_shift = 0.2   # Example value for beta spin
-                                mf.level_shift = (alpha_shift, beta_shift)
-                                logger.info(mf, 'Level shifting turned ON: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
+                need_ls = bool(gb.predict_proba(features)[0, 1] >= threshold)
 
-                                # Reset the DIIS after level shifting
-                                if isinstance(mf_diis, lib.diis.DIIS):
-                                    space, damp = reset_diis(mf, one_plain_step=True, fresh_file=True)
-                                    logger.info(mf, "DIIS flushed; generation=%d space=%s damp=%s file=%s", mf._diis_generation, space, damp, getattr(getattr(mf.diis, '_diisfile', None), 'filename', None))
-
-                        elif ls_cycles == 30: # Increase level shifting after 30 cycles
-                            alpha_shift, beta_shift = mf.level_shift
-                            if beta_shift <=1.9:
-                                beta_shift += 0.1
-                                mf.level_shift = (alpha_shift, beta_shift)
-                                logger.info(mf, 'Alpha shift increased: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
-                                ls_cycles = 0
-                                 # Reset the DIIS after level shifting
-                                if isinstance(mf_diis, lib.diis.DIIS):
-                                    space, damp = reset_diis(mf, one_plain_step=True, fresh_file=True)
-                                    logger.info(mf, "DIIS flushed; generation=%d space=%s damp=%s file=%s", mf._diis_generation, space, damp, getattr(getattr(mf.diis, '_diisfile', None), 'filename', None))
-                            else:
-                                logger.info(mf, 'Reach maximum shift value: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
-                                ls_cycles += 1
-                        else: # Maintain current level shifting
-                            alpha_shift, beta_shift = mf.level_shift
-                            logger.info(mf, 'Level shifting maintained: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
-                            ls_cycles += 1
-                    else:
-                     #Remove level shifting
-                        if mf.level_shift != (0.0, 0.0):
-                            if mf.level_shift == 0:
-                                logger.info(mf, 'Level shifting is not necessary')
-                            else:
-                                cooldown_counter = 30
-                                logger.info(mf, f'Level shifting turned OFF. Previous value: {mf.level_shift}')
-                                mf.level_shift = (0.0, 0.0)
-                                #Reset the cycle counter for level shifting
-                                ls_cycles = 0
-                                # Reset the DIIS after level shifting
-                                if isinstance(mf_diis, lib.diis.DIIS):
-                                    space, damp = reset_diis(mf, one_plain_step=True, fresh_file=True)
-                                    logger.info(mf, "DIIS flushed; generation=%d space=%s damp=%s file=%s", mf._diis_generation, space, damp, getattr(getattr(mf.diis, '_diisfile', None), 'filename', None))
-                        else:
-                            logger.info(mf, 'Level shifting is not necessary')
+                # Use ML model to predict whether level shifting is needed
+                if need_ls:
+                    raise RuntimeError(f"Restart SCF with new beta shift. Cycle={cycle}")  # External logic should handle restart
+                else:
+                    logger.info(mf, 'ML predicts easy convergence. Proceeding calculation.')
 
         if callable(mf.check_convergence):
             scf_conv = mf.check_convergence(locals())
@@ -377,8 +290,6 @@ Keyword argument "init_dm" is replaced by "dm0"''')
             scf_conv = mf.check_convergence(locals())
         elif abs(e_tot-last_hf_e) < conv_tol or norm_gorb < conv_tol_grad:
             scf_conv = True
-        else:
-            scf_conv = False
         logger.info(mf, 'Extra cycle  E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                     e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
         if dump_chk and mf.chkfile:
@@ -394,7 +305,7 @@ def energy_elec(mf, dm=None, h1e=None, vhf=None):
     r'''Electronic part of Hartree-Fock energy, for given core hamiltonian and
     HF potential
 
-    .. math::
+    ... math::
 
         E = \sum_{ij}h_{ij} \gamma_{ji}
           + \frac{1}{2}\sum_{ijkl} \gamma_{ji}\gamma_{lk} \langle ik||jl\rangle
@@ -606,14 +517,6 @@ def init_guess_by_minao(mol):
         if not gto.is_ghost_atom(symb):
             occ.append(occdic[symb])
             new_atom.append(mol._atom[ia])
-
-    if not occ:
-        # A system with only ghost atoms. (issue 3155)
-        nao = mol.nao
-        occ = numpy.zeros(nao)
-        dm = mo_coeff = numpy.zeros((nao, nao))
-        return lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=occ)
-
     occ = numpy.hstack(occ)
 
     pmol = gto.Mole()
@@ -1306,8 +1209,6 @@ def get_occ(mf, mo_energy=None, mo_coeff=None):
     mo_occ = numpy.zeros_like(mo_energy)
     nocc = mf.mol.nelectron // 2
     mo_occ[e_idx[:nocc]] = 2
-    if nocc > nmo:
-        raise RuntimeError(f'Failed to assign mo_occ. Nocc ({nocc}) > Nmo ({nmo})')
     if mf.verbose >= logger.INFO and nocc < nmo:
         if e_sort[nocc-1]+1e-3 > e_sort[nocc]:
             logger.warn(mf, 'HOMO %.15g == LUMO %.15g',
@@ -2134,8 +2035,6 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
     do_disp = dispersion.check_disp
     get_dispersion = dispersion.get_dispersion
 
-    smearing = smearing.smearing
-
     def energy_nuc(self):
         return self.mol.enuc
 
@@ -2311,29 +2210,7 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
 
     def density_fit(self, auxbasis=None, with_df=None, only_dfj=False):
         import pyscf.df.df_jk
-        if self.istype('_Solvation'):
-            logger.warn(self,
-                'It is recommended to call density_fit() before applying a solvent model. '
-                'Calling density_fit() after the solvent model may result in '
-                'incorrect nuclear gradients, TDDFT and other methods.')
         return pyscf.df.df_jk.density_fit(self, auxbasis, with_df, only_dfj)
-
-    def multigrid_numint(self, margin=None, mesh=None):
-        '''Apply the MultiGrid algorithm for XC numerical integartion.
-
-        Kwargs:
-            margin : float
-                A box will be created to enclose the molecule, with the molecule
-                positioned at the center. "margin" specifies the distance from
-                the edge of the molecule to the edge of the box. If not provided,
-                a default margin is estimated, which ensures that the electron
-                density decays to approximately 1e-7 at the boundary of the box.
-            mesh : (3,) ndarray
-                The number of mesh grids along each axis. If not specified, the
-                number of mesh grids will be estimated based on the basis sets
-                and the margin.
-        '''
-        raise NotImplementedError
 
     def sfx2c1e(self):
         import pyscf.x2c.sfx2c1e
@@ -2357,10 +2234,6 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
         raise NotImplementedError
 
     def nuc_grad_method(self):  # pragma: no cover
-        '''Hook to create object for analytical nuclear gradients.'''
-        return self.Gradients()
-
-    def Gradients(self):  # pragma: no cover
         '''Hook to create object for analytical nuclear gradients.'''
         raise NotImplementedError
 
@@ -2491,13 +2364,6 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
         '''This helper function transfers attributes from one SCF object to
         another SCF object. It is invoked by to_ks and to_hf methods.
         '''
-        from pyscf.df.df_jk import _DFHF
-        if isinstance(self, _DFHF) and not hasattr(dst, 'with_df'):
-            # * Handle DF_SCF instances for to_xxx methods.
-            # * Only the molecular SCF methods need to be explicitly converted.
-            #   For PBC SCF methods, DF is enabled by default. calling density_fit()
-            #   may alter the DF class. Conversion should be avoided here.
-            dst = dst.density_fit(auxbasis=self.with_df.auxbasis)
         # Search for all tracked attributes, including those in base classes
         cls_keys = [getattr(cls, '_keys', ()) for cls in dst.__class__.__mro__[:-1]]
         dst_keys = set(dst.__dict__).union(*cls_keys)
@@ -2638,6 +2504,7 @@ class RHF(SCF):
         from pyscf import dft
         return self._transfer_attrs_(dft.RKS(self.mol, xc=xc))
 
+    # FIXME: consider the density_fit, x2c and soscf decoration
     to_gpu = lib.to_gpu
 
 def _hf1e_scf(mf, *args):
@@ -2649,10 +2516,26 @@ def _hf1e_scf(mf, *args):
     mf.mo_energy, mf.mo_coeff = mf.eig(h1e, s1e)
     mf.mo_occ = mf.get_occ(mf.mo_energy, mf.mo_coeff)
     mf.e_tot = mf.mo_energy[mf.mo_occ>0][0].real + mf.mol.energy_nuc()
-    if mf.chkfile:
-        mf.dump_chk(mf.chkfile)
     mf._finalize()
     return mf.e_tot
 
 
 del (WITH_META_LOWDIN, PRE_ORTH_METHOD)
+
+
+if __name__ == '__main__':
+    from pyscf import scf
+    mol = gto.Mole()
+    mol.verbose = 5
+    mol.output = None
+
+    mol.atom = [['He', (0, 0, 0)], ]
+    mol.basis = 'ccpvdz'
+    mol.build(0, 0)
+
+##############
+# SCF result
+    method = scf.RHF(mol).x2c().density_fit().newton()
+    method.init_guess = '1e'
+    energy = method.scf()
+    print(energy)
