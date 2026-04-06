@@ -222,7 +222,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     cooldown_counter = 0
 
     try:
-        model_path = '/Users/leodong/Downloads/Research/Research_Liu/AI_Calculation/RL_SP_DP/gb_10k_refined.pkl'
+        model_path = os.path.join(os.path.dirname(__file__), 'gb_10k_refined.pkl')
         with open(model_path, "rb") as file:
             gb = pickle.load(file)
     except FileNotFoundError:
