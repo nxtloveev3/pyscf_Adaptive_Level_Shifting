@@ -39,6 +39,7 @@ from pyscf.scf.data_processing import process_orbital_data, generate_features
 from sklearn.ensemble import GradientBoostingClassifier
 import pickle
 import os
+import random
 
 
 WITH_META_LOWDIN = getattr(__config__, 'scf_analyze_with_meta_lowdin', True)
@@ -46,6 +47,42 @@ PRE_ORTH_METHOD = getattr(__config__, 'scf_analyze_pre_orth_method', 'ANO')
 MO_BASE = getattr(__config__, 'MO_BASE', 1)
 TIGHT_GRAD_CONV_TOL = getattr(__config__, 'scf_hf_kernel_tight_grad_conv_tol', True)
 MUTE_CHKFILE = getattr(__config__, 'scf_hf_SCF_mute_chkfile', False)
+
+def reset_diis(mf, one_plain_step=False, fresh_file=True):
+    # Preserve knobs
+    space     = getattr(mf.diis, 'space',     getattr(mf, 'diis_space', 8)) if isinstance(mf.diis, lib.diis.DIIS) else getattr(mf, 'diis_space', 8)
+    rollback  = getattr(mf.diis, 'rollback',  getattr(mf, 'diis_space_rollback', None)) if isinstance(mf.diis, lib.diis.DIIS) else getattr(mf, 'diis_space_rollback', None)
+    damp      = getattr(mf.diis, 'damp',      getattr(mf, 'diis_damp', 0.0)) if isinstance(mf.diis, lib.diis.DIIS) else getattr(mf, 'diis_damp', 0.0)
+
+    # Optional: take exactly one step with DIIS disabled under the new Hamiltonian
+    if one_plain_step:
+        mf.diis = None
+        mf.diis_start_cycle = 9_999_999  # effectively off; you'll set back to 0 below
+
+    # IMPORTANT: avoid reusing the same out-of-core file (it can keep stale arrays)
+    diis_file = None
+    if not fresh_file:
+        diis_file = getattr(mf, 'diis_file', None)
+    else:
+        # create a truly fresh file so nothing "leaks" from a previous DIIS
+        fd, path = tempfile.mkstemp(prefix="pyscf_diis_", suffix=".h5")
+        os.close(fd)
+        diis_file = path
+
+    # Recreate the configured flavor (CDIIS/ADIIS/EDIIS)
+    mf.diis = mf.DIIS(mf, diis_file)
+    mf.diis.space    = space
+    mf.diis.rollback = rollback
+    mf.diis.damp     = damp
+    mf.diis_start_cycle = 0  # start immediately
+
+    # For callers that may still have f_prev
+    if hasattr(mf, '_last_fock'):
+        mf._last_fock = None
+
+    # Optional: record a generation counter
+    mf._diis_generation = getattr(mf, '_diis_generation', 0) + 1
+    return space, damp
 
 def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
            dump_chk=True, dm0=None, callback=None, conv_check=True, dynamic_ls=False, **kwargs):
@@ -181,6 +218,18 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     homo_1_beta_10 = []
     homo_beta_10 = []
     ls_cycles = 0
+    cooldown_counter = 0
+
+    try:
+        model_path = '/Users/leodong/Downloads/Research/Research_Liu/AI_Calculation/RL_SP_DP/gb_10k_refined.pkl'
+        with open(model_path, "rb") as file:
+            gb = pickle.load(file)
+    except FileNotFoundError:
+        logger.error(mf, 'ML model file not found.')
+        raise
+    except pickle.UnpicklingError:
+        logger.error(mf, 'Error loading ML model file.')
+        raise
     
     for cycle in range(mf.max_cycle):
         dm_last = dm
@@ -225,57 +274,69 @@ Keyword argument "init_dm" is replaced by "dm0"''')
                 if len(homo_beta_10) > 10:
                     homo_beta_10.pop(0)
 
-                if cycle >= 10:
-                    try:
-                        model_path = os.path.join(os.path.dirname(__file__), 'gb_2k_no_diis_tuned_new.pkl')
-                        with open(model_path, "rb") as file:
-                            gb = pickle.load(file)
-                    except FileNotFoundError:
-                        logger.error(mf, 'ML model file not found.')
-                        raise
-                    except pickle.UnpicklingError:
-                        logger.error(mf, 'Error loading ML model file.')
-                        raise
-
+                if cycle > 10:
                     features = generate_features(en_tot_10, homo_alpha_10, homo_1_beta_10, homo_beta_10, alpha_gap_10)
 
                     logger.info(mf, 'Features used for ML prediction: %s', features)
                     
-                    need_ls = bool(gb.predict(features))
+                    need_ls = bool(gb.predict_proba(features)[0, 1] >= 0.802)
 
                     # Use ML model to predict whether level shifting is needed
                     if need_ls:
-                        # Set level shifting for both alpha and beta spins
+                    #     raise RuntimeError("Restart SCF with new alpha shift.")  # External logic should handle restart
+                    # else:
+                    #     logger.info(mf, 'ML predicts easy convergence. Proceeding calculation.')
+                    # Set level shifting for both alpha and beta spins
                         if mf.level_shift == 0 or mf.level_shift == (0.0, 0.0): # Check if level shifting is off
-                            alpha_shift = 0.2  # Example value for alpha spin
-                            beta_shift = 0.0   # Example value for beta spin
-                            mf.level_shift = (alpha_shift, beta_shift)
-                            logger.info(mf, 'Level shifting turned ON: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
-                            ls_cycles += 1
-                        elif ls_cycles == 10: # Increase level shifting after 10 cycles
+                            if cooldown_counter > 0:
+                                cooldown_counter -= 1
+                                logger.info(mf,  'Level shifting is suggested but in cooldown cycle.')
+                            else:
+                                alpha_shift = 0.0  # Example value for alpha spin
+                                beta_shift = 0.2   # Example value for beta spin
+                                mf.level_shift = (alpha_shift, beta_shift)
+                                logger.info(mf, 'Level shifting turned ON: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
+
+                                # Reset the DIIS after level shifting
+                                if isinstance(mf_diis, lib.diis.DIIS):
+                                    space, damp = reset_diis(mf, one_plain_step=True, fresh_file=True)
+                                    logger.info(mf, "DIIS flushed; generation=%d space=%s damp=%s file=%s", mf._diis_generation, space, damp, getattr(getattr(mf.diis, '_diisfile', None), 'filename', None))
+
+                        elif ls_cycles == 30: # Increase level shifting after 30 cycles
                             alpha_shift, beta_shift = mf.level_shift
-                            alpha_shift += 0.1
-                            #beta_shift += 0.1
-                            mf.level_shift = (alpha_shift, beta_shift)
-                            logger.info(mf, 'Level shifting increased: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
-                            ls_cycles = 0
+                            if beta_shift <=1.9:
+                                beta_shift += 0.1
+                                mf.level_shift = (alpha_shift, beta_shift)
+                                logger.info(mf, 'Alpha shift increased: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
+                                ls_cycles = 0
+                                 # Reset the DIIS after level shifting
+                                if isinstance(mf_diis, lib.diis.DIIS):
+                                    space, damp = reset_diis(mf, one_plain_step=True, fresh_file=True)
+                                    logger.info(mf, "DIIS flushed; generation=%d space=%s damp=%s file=%s", mf._diis_generation, space, damp, getattr(getattr(mf.diis, '_diisfile', None), 'filename', None))
+                            else:
+                                logger.info(mf, 'Reach maximum shift value: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
+                                ls_cycles += 1
                         else: # Maintain current level shifting
                             alpha_shift, beta_shift = mf.level_shift
                             logger.info(mf, 'Level shifting maintained: Alpha= %.3g, Beta= %.3g', alpha_shift, beta_shift)
                             ls_cycles += 1
                     else:
-                        # Remove level shifting
-                        if mf.level_shift != (0.0, 0.0): 
+                     #Remove level shifting
+                        if mf.level_shift != (0.0, 0.0):
                             if mf.level_shift == 0:
                                 logger.info(mf, 'Level shifting is not necessary')
                             else:
+                                cooldown_counter = 30
                                 logger.info(mf, f'Level shifting turned OFF. Previous value: {mf.level_shift}')
                                 mf.level_shift = (0.0, 0.0)
-                                # Reset the cycle counter for level shifting
+                                #Reset the cycle counter for level shifting
                                 ls_cycles = 0
+                                # Reset the DIIS after level shifting
+                                if isinstance(mf_diis, lib.diis.DIIS):
+                                    space, damp = reset_diis(mf, one_plain_step=True, fresh_file=True)
+                                    logger.info(mf, "DIIS flushed; generation=%d space=%s damp=%s file=%s", mf._diis_generation, space, damp, getattr(getattr(mf.diis, '_diisfile', None), 'filename', None))
                         else:
                             logger.info(mf, 'Level shifting is not necessary')
-
 
         if callable(mf.check_convergence):
             scf_conv = mf.check_convergence(locals())
