@@ -184,7 +184,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
     threshold = 0.802 
 
     try:
-        model_path = os.path.join(os.path.dirname(__file__), 'gb_10k_refined.pkl')
+        model_path = os.path.join(os.path.dirname(__file__), 'iMedium_model.pkl') # Default to model trained on medium size training set
         with open(model_path, "rb") as file:
             gb = pickle.load(file)
     except FileNotFoundError:
